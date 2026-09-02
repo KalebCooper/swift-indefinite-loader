@@ -1,0 +1,130 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages publish in flight at a time; never cancel a running deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build DocC site
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/configure-pages@v6
+      # Built one product at a time rather than through the whole-package scheme, because
+      # IndefiniteLoadingUI's doc comments link into IndefiniteLoading (``IndefiniteLoading/
+      # IndefiniteLoadState``) and DocC does not reach into another module on its own: without the
+      # flags below it renders such a link as plain text. IndefiniteLoading is built first and
+      # publishes link metadata; the UI product then resolves against that archive. The flags are
+      # experimental, so a toolchain bump can rename them.
+      #
+      # Destination and simulator OS mirror ci.yml's apple lane. Each build gets its own derived
+      # data: building the UI product builds IndefiniteLoading's documentation again as part of the
+      # same graph, and sharing one directory would have the second pass rewriting the very archive
+      # it was told to resolve against.
+      - name: Build IndefiniteLoading documentation
+        run: |
+          set -o pipefail
+          xcodebuild docbuild \
+            -scheme IndefiniteLoading \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.2' \
+            -derivedDataPath .derivedData-core \
+            OTHER_DOCC_FLAGS='--enable-experimental-external-link-support' \
+            | xcbeautify --renderer github-actions
+      # Lifted out of derived data, so the path handed to --dependency belongs to nothing a later
+      # build writes to. This copy is also what the merge step reads.
+      - name: Stage IndefiniteLoading archive
+        id: core
+        run: |
+          set -euo pipefail
+          found="$(find .derivedData-core -type d -name 'IndefiniteLoading.doccarchive' | head -1)"
+          if [ -z "$found" ]; then
+            echo "::error::no IndefiniteLoading.doccarchive under .derivedData-core"
+            exit 1
+          fi
+          mkdir -p .docc-deps
+          cp -R "$found" .docc-deps/IndefiniteLoading.doccarchive
+          if [ ! -f .docc-deps/IndefiniteLoading.doccarchive/linkable-entities.json ]; then
+            echo "::error::IndefiniteLoading.doccarchive carries no link metadata; the flag did not take"
+            exit 1
+          fi
+          echo "archive=$PWD/.docc-deps/IndefiniteLoading.doccarchive" >> "$GITHUB_OUTPUT"
+      - name: Build IndefiniteLoadingUI documentation
+        run: |
+          set -o pipefail
+          xcodebuild docbuild \
+            -scheme IndefiniteLoadingUI \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.2' \
+            -derivedDataPath .derivedData \
+            OTHER_DOCC_FLAGS="--enable-experimental-external-link-support --dependency ${{ steps.core.outputs.archive }}" \
+            | xcbeautify --renderer github-actions
+      # Two products means two archives. A merged archive gets a synthesized landing page at
+      # /documentation/ that lists both modules, so one site covers the whole package.
+      - name: Merge archives
+        run: |
+          set -euo pipefail
+          ui="$(find .derivedData -type d -name 'IndefiniteLoadingUI.doccarchive' | head -1)"
+          if [ -z "$ui" ]; then
+            echo "::error::no IndefiniteLoadingUI.doccarchive under .derivedData"
+            exit 1
+          fi
+          "$(xcrun --find docc)" merge \
+            .docc-deps/IndefiniteLoading.doccarchive "$ui" \
+            --synthesized-landing-page-name swift-indefinite-loader \
+            --synthesized-landing-page-kind Package \
+            --output-path .merged.doccarchive
+      # The site serves from https://<owner>.github.io/swift-indefinite-loader/, so the archive is
+      # rewritten for that sub-path.
+      - name: Transform for static hosting
+        run: |
+          set -euo pipefail
+          "$(xcrun --find docc)" process-archive transform-for-static-hosting \
+            .merged.doccarchive \
+            --output-path _site \
+            --hosting-base-path swift-indefinite-loader
+      # DocC's static output has no landing page at the site root, so the root redirects into the
+      # merged landing route.
+      - name: Write root redirect
+        run: |
+          set -euo pipefail
+          cat > _site/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta http-equiv="refresh" content="0; url=documentation/">
+              <link rel="canonical" href="https://kalebcooper.github.io/swift-indefinite-loader/documentation/">
+              <title>swift-indefinite-loader</title>
+            </head>
+            <body>
+              <p>Redirecting to the <a href="documentation/">swift-indefinite-loader documentation</a>.</p>
+            </body>
+          </html>
+          HTML
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    # Only main publishes; a workflow_dispatch on another ref builds and stops.
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

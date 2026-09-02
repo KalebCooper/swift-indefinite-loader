@@ -1,0 +1,146 @@
+name: CI
+
+# Five test lanes, a lint lane, and a release job that tags main once CHANGELOG.md carries a
+# released heading with no tag behind it. Linux, Windows, WebAssembly, and Android prove
+# IndefiniteLoading stays portable off Apple platforms and are cheap. The macOS lane is the real
+# target for IndefiniteLoadingUI and costs money: batch commits and push once.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    name: Package tests (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.3-noble
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache SwiftPM build products
+        uses: actions/cache@v6
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ github.sha }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-
+            spm-${{ runner.os }}-
+      - name: Run tests
+        run: swift test
+
+  windows:
+    name: Package tests (Windows)
+    runs-on: windows-latest
+    steps:
+      # Pinned to a swift.org release build so a toolchain change is a deliberate edit here.
+      - uses: compnerd/gha-setup-swift@v0.4.0
+        with:
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
+      - uses: actions/checkout@v7
+      - name: Run tests
+        run: swift test
+
+  wasm:
+    name: Package tests (WebAssembly)
+    runs-on: ubuntu-latest
+    container: swift:6.3-noble
+    steps:
+      - uses: actions/checkout@v7
+      # The SDK version must match the toolchain in the container exactly. The checksum comes from
+      # https://www.swift.org/api/v1/install/releases.json, the `wasm-sdk` platform entry. The
+      # toolchain bundles WasmKit, and SwiftPM runs a Wasm test binary under it by default.
+      - name: Install the Swift SDK for WebAssembly
+        run: |
+          swift sdk install \
+            https://download.swift.org/swift-6.3.3-release/wasm-sdk/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE_wasm.artifactbundle.tar.gz \
+            --checksum cabfa08b73bb8ac783927ecd15fa386e99d0c139c5f232445067bcf58379cae7
+      - name: Run tests
+        run: swift test --swift-sdk swift-6.3.3-RELEASE_wasm
+
+  android:
+    name: Package tests (Android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Installs the matching host toolchain, the swift.org Android SDK, and the NDK, cross-compiles
+      # the package and its tests, and runs them in an emulator. The action resolves a minor
+      # version to its latest patch.
+      - uses: skiptools/swift-android-action@v2.9.5
+        with:
+          swift-version: '6.3'
+
+  apple:
+    name: Build & Test (iOS Simulator)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      # The whole-package scheme carries every target, including the SwiftUI product this lane alone
+      # compiles. The OS is pinned to the lowest iOS 26 runtime the runner image carries, so the lane
+      # tests near the package's floor and moves only when someone edits this line.
+      - name: Build and test
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -scheme swift-indefinite-loader-Package \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.2' \
+            | xcbeautify --renderer github-actions
+
+  lint:
+    name: swift-format lint
+    runs-on: ubuntu-latest
+    container: swift:6.3-noble
+    steps:
+      - uses: actions/checkout@v7
+      - name: Lint
+        run: swift format lint --strict --recursive Sources Tests
+
+  release:
+    name: Cut release tag
+    needs: [linux, windows, wasm, android, apple, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # The topmost `## [X.Y.Z]` heading in CHANGELOG.md names the version. `## Unreleased` is
+      # skipped, and a version whose tag already exists is left alone.
+      - name: Read the released version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -E '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | sed -E 's/^## \[([^]]+)\].*/\1/' || true)"
+          if [ -z "$version" ]; then
+            echo "No released version in CHANGELOG.md; nothing to tag."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="v$version"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists; nothing to tag."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # The release notes are that version's CHANGELOG section, verbatim.
+      - name: Extract release notes
+        if: steps.version.outputs.tag != ''
+        run: |
+          set -euo pipefail
+          awk -v tag="${{ steps.version.outputs.tag }}" '
+            /^## \[/ { if (found) exit; if ("v" substr($2, 2, length($2) - 2) == tag) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          cat release-notes.md
+      - name: Create tag and release
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes-file release-notes.md
