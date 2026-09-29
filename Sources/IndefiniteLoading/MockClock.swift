@@ -127,8 +127,12 @@ public final class MockClock: Clock, Sendable {
   /// Sleepers are resumed in deadline order; which resumed task runs first is the executor's
   /// decision. A sleeper whose deadline is still ahead stays parked.
   ///
-  /// - Parameter duration: How far forward to move the reading.
+  /// The reading never moves backward, as the `Clock` contract requires, so a negative `duration`
+  /// traps.
+  ///
+  /// - Parameter duration: How far forward to move the reading. Must be zero or greater.
   public func advance(by duration: Duration) {
+    precondition(duration >= .zero, "MockClock cannot move its reading backward.")
     let released: [CheckedContinuation<Void, any Error>] = state.withLock { state in
       state.now = state.now.advanced(by: duration)
       let now = state.now

@@ -15,6 +15,8 @@ All notable changes to this project are documented here. The format follows
   parks until `advance(by:)` moves the reading to its deadline and returns at once when the
   deadline has already been reached, so a `delay: .zero` loader shows its indicator without the
   test advancing anything. `now` is a property, and `init()` replaces `init(now:)`.
+- **Breaking:** `MockClock.advance(by:)` traps on a negative duration. The reading never moves
+  backward, as the `Clock` contract requires.
 
 ### Removed
 

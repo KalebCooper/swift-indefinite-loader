@@ -69,9 +69,32 @@ private struct OperationGate: Sendable {
   }
 }
 
+/// Upper bound on every yield-based wait in this file, so a genuine regression fails loudly instead
+/// of hanging a CI job until the suite-level timeout.
+private let maximumYieldIterations = 10_000
+
+/// Yields until at least `count` tasks are parked on `clock`, bounded like every other wait here.
+///
+/// A sleeper registers on its own task, so advancing before it is parked moves the reading under it
+/// and pushes its deadline past the test's advance. The `timeout:` configuration arms two sleeps,
+/// so the count is explicit. A regression that never parks the expected sleep records an issue at
+/// the cap instead of hanging.
+private func waitForPendingSleeps(_ count: Int, on clock: MockClock) async {
+  var iterations = 0
+  while clock.pendingSleepCount < count {
+    guard iterations < maximumYieldIterations else {
+      Issue.record(
+        "Timed out waiting for \(count) parked sleeps; found \(clock.pendingSleepCount).")
+      return
+    }
+    iterations += 1
+    await Task.yield()
+  }
+}
+
 /// `IndefiniteLoader` proofs against `MockClock`. All time is driven through the clock
-/// (`waitForPendingSleep()` awaits the loader parking in a sleep; `advance(by:)` moves the reading
-/// and releases every sleep whose deadline it reaches). No wall-clock sleeps anywhere.
+/// (`waitForPendingSleeps(_:on:)` awaits the loader parking in a sleep; `advance(by:)` moves the
+/// reading and releases every sleep whose deadline it reaches). No wall-clock sleeps anywhere.
 ///
 /// Two `MockClock` properties shape every test here:
 /// 1. A sleep ends when the reading reaches its deadline, not a moment before, and a sleep whose
@@ -106,12 +129,12 @@ struct IndefiniteLoaderTests {
 
     // The delay timer is armed and parked, so this test controls a REAL race rather than an
     // absent one. `.delayed` is emitted synchronously; nothing is rendered yet.
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     #expect(recorder.states == [.loading(phase: .delayed)])
 
     // The operation wins: it resolves while the delay timer is still parked.
     gate.open()
-    await loadTask.value
+    await finish(loadTask) { recorder.states.count == 2 }
 
     #expect(
       recorder.states == [
@@ -150,7 +173,7 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
 
     // Reaching the delay deadline releases the timer; the indicator is shown at this reading, and
     // the minimum-duration arithmetic below is measured from it.
@@ -165,7 +188,7 @@ struct IndefiniteLoaderTests {
 
     // The loader parks in `enforceMinimumDuration`'s sleep instead of emitting the terminal
     // state. That parked sleep IS the hold: measured, not assumed.
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     #expect(recorder.states.count == 2)
 
     // Reaching the remaining 0.7 s releases the hold.
@@ -196,7 +219,7 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
 
     // The timer is still registered, not merely unscheduled: the reading has not reached its
     // deadline, so nothing was released.
@@ -231,13 +254,13 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     clock.advance(by: .milliseconds(1000))
     await waitForStates(2, on: recorder)
 
     clock.advance(by: .milliseconds(500))
     gate.open()
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
 
     clock.advance(by: .milliseconds(700) - .nanoseconds(1))
     #expect(clock.pendingSleepCount == 1)
@@ -271,11 +294,11 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     #expect(recorder.states == [.loaded(data: "cached", updatingPhase: .delayed, error: nil)])
 
     gate.open()
-    await loadTask.value
+    await finish(loadTask) { recorder.states.count == 2 }
 
     #expect(
       recorder.states == [
@@ -310,7 +333,7 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     clock.advance(by: .milliseconds(800))
     await waitForStates(2, on: recorder)
 
@@ -352,9 +375,9 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     gate.open()
-    await loadTask.value
+    await finish(loadTask) { recorder.states.count == 2 }
 
     #expect(recorder.states.count == 2)
     guard case .loaded(let data, let updatingPhase, let error) = recorder.states.last else {
@@ -382,9 +405,9 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     gate.open()
-    await loadTask.value
+    await finish(loadTask) { recorder.states.count == 2 }
 
     #expect(recorder.states.count == 2)
     guard case .failed(let error) = recorder.states.last else {
@@ -413,7 +436,7 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     loadTask.cancel()
     await loadTask.value
 
@@ -440,7 +463,7 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     loadTask.cancel()
     await loadTask.value
 
@@ -466,7 +489,7 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     #expect(firstRecorder.states == [.loading(phase: .delayed)])
 
     // The second load re-enters while the first is parked; `clearState()` must orphan the first.
@@ -477,7 +500,7 @@ struct IndefiniteLoaderTests {
         secondRecorder.record($0)
       }
     }
-    await secondLoad.value
+    await finish(secondLoad) { secondRecorder.states.count == 2 }
 
     // Releasing the first operation must not resurrect its callbacks.
     firstGate.open()
@@ -524,7 +547,7 @@ struct IndefiniteLoaderTests {
 
     // Even though the operation is done, the terminal state is withheld: the spinner is held
     // so the tap feedback registers.
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     #expect(recorder.shapes.count == 2)
 
     clock.advance(by: .milliseconds(400))
@@ -617,10 +640,6 @@ struct IndefiniteLoaderTests {
 
   // MARK: - Fixtures
 
-  /// Upper bound on every yield-based wait below, so a genuine regression fails loudly instead of
-  /// hanging a CI job until the suite-level timeout.
-  private static let maximumYieldIterations = 10_000
-
   private enum TestError: Error, Equatable {
     case boom
   }
@@ -630,7 +649,7 @@ struct IndefiniteLoaderTests {
   /// The negative cases assert the *absence* of an `.active` state, so there is no count to poll
   /// for; only a drain can distinguish "never emitted" from "not scheduled yet".
   private func drainReleasedWork() async {
-    for _ in 0..<Self.maximumYieldIterations {
+    for _ in 0..<maximumYieldIterations {
       await Task.yield()
     }
   }
@@ -643,7 +662,7 @@ struct IndefiniteLoaderTests {
   private func finish(_ loadTask: Task<Void, Never>, once condition: () -> Bool) async {
     var iterations = 0
     while !condition() {
-      guard iterations < Self.maximumYieldIterations else {
+      guard iterations < maximumYieldIterations else {
         Issue.record("Timed out waiting for the load to finish.")
         break
       }
@@ -665,16 +684,6 @@ struct IndefiniteLoaderTests {
       clock: clock, delay: delay, minimumDuration: minimumDuration, timeout: timeout)
   }
 
-  /// Yields until `count` tasks are parked on `MockClock`. `waitForPendingSleep()` only guarantees
-  /// at least one; the `timeout:` configuration arms two, and advancing before both are parked
-  /// would move the reading under the late one and push its deadline past the test's advance.
-  private func waitForPendingSleeps(_ count: Int, on clock: MockClock) async {
-    await clock.waitForPendingSleep()
-    while clock.pendingSleepCount < count {
-      await Task.yield()
-    }
-  }
-
   /// Yields until `recorder` has captured `count` states.
   ///
   /// `advance(by:)` only resumes the delay timer's continuation; the emit happens later, in that
@@ -686,7 +695,7 @@ struct IndefiniteLoaderTests {
   ) async {
     var iterations = 0
     while recorder.states.count < count {
-      guard iterations < Self.maximumYieldIterations else {
+      guard iterations < maximumYieldIterations else {
         Issue.record("Timed out waiting for \(count) states; recorded \(recorder.states.count).")
         return
       }
@@ -707,7 +716,7 @@ struct MockClockTests {
       try await clock.sleep(until: deadline)
     }
 
-    await clock.waitForPendingSleep()
+    await waitForPendingSleeps(1, on: clock)
     sleeper.cancel()
     await #expect(throws: CancellationError.self) {
       try await sleeper.value
@@ -718,5 +727,30 @@ struct MockClockTests {
     // would trap.
     clock.advance(by: .seconds(2))
     #expect(clock.now == deadline.advanced(by: .seconds(1)))
+  }
+
+  /// The thrown error carries the claim. A sleeper that parked despite its cancellation would wait
+  /// on a deadline nothing reaches, so the test advances to that deadline: a sleeper that parked is
+  /// released, one that registers late finds the deadline reached, and either returns normally
+  /// instead of hanging. The count is the postcondition, zero on every path.
+  @Test("A task cancelled before it sleeps throws CancellationError without parking")
+  func sleeperCancelledBeforeSleepingThrowsWithoutParking() async {
+    let clock = MockClock()
+    let deadline = clock.now.advanced(by: .seconds(1))
+    let (started, start) = AsyncStream<Void>.makeStream()
+    let sleeper = Task {
+      for await _ in started {}
+      try await clock.sleep(until: deadline)
+    }
+
+    // The sleeper cannot pass the stream until it is finished or the task is cancelled, and the
+    // cancel lands first, so it reaches `sleep(until:)` already cancelled.
+    sleeper.cancel()
+    start.finish()
+    clock.advance(by: .seconds(1))
+    await #expect(throws: CancellationError.self) {
+      try await sleeper.value
+    }
+    #expect(clock.pendingSleepCount == 0)
   }
 }
