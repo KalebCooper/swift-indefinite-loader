@@ -11,6 +11,7 @@ a screen with two independently loaded sections gets two loaders.
 
 ```swift
 import IndefiniteLoading
+import Observation
 
 @MainActor
 @Observable

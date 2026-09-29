@@ -22,11 +22,22 @@ import Synchronization
 /// ```swift
 /// let clock = MockClock()
 /// let loader = IndefiniteLoader<String>(clock: clock)
+/// let (released, release) = AsyncStream<Void>.makeStream()
+/// var states: [IndefiniteLoadState<String>] = []
+///
 /// let load = Task {
-///   await loader.load { "fresh" } loadState: { recorder.record($0) }
+///   await loader.load {
+///     for await _ in released {}
+///     return "fresh"
+///   } loadState: { states.append($0) }
 /// }
+///
 /// await clock.waitForPendingSleep()
 /// clock.advance(by: .milliseconds(800))
+/// while states.count < 2 { await Task.yield() }
+/// release.finish()
+/// await clock.waitForPendingSleep()
+/// clock.advance(by: .milliseconds(1200))
 /// await load.value
 /// ```
 ///

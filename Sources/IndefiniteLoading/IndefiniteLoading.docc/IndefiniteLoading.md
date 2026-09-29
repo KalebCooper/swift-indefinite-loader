@@ -32,11 +32,16 @@ func load(updating cached: Profile? = nil) async {
 }
 ```
 
-The module depends on no UI framework and builds wherever Swift does: Apple platforms, Linux, and
-Windows. Rendering is the consumer's job. The `IndefiniteLoadingUI` product in the same package
-ships two SwiftUI views that encode the `.delayed`/`.active` split structurally, so a view cannot
-defeat the grace period by accident. ``MockClock`` stands in for the clock in tests, so every timing
-rule is asserted as a sequence of states rather than measured against wall time.
+Every sleep and every elapsed-time measurement goes through one standard library `Clock` measured
+in `Duration`, passed to ``IndefiniteLoader/init(clock:delay:minimumDuration:timeout:)``.
+Production code takes the default, `ContinuousClock`. Tests pass a ``MockClock``, whose reading
+moves only when the test advances it, so every timing rule is asserted as a sequence of states
+rather than measured against wall time.
+
+The module depends on no UI framework and builds wherever Swift does: Apple platforms, Linux,
+Windows, Android, and WebAssembly. Rendering is the consumer's job. The `IndefiniteLoadingUI`
+product in the same package ships two SwiftUI views that encode the `.delayed`/`.active` split
+structurally, so a view cannot defeat the grace period by accident.
 
 ## Topics
 
@@ -54,8 +59,6 @@ rule is asserted as a sequence of states rather than measured against wall time.
 ### Time
 
 - <doc:Testing>
-- ``ClockProtocol``
-- ``SystemClock``
 - ``MockClock``
 
 ### Substituting the Loader

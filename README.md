@@ -185,21 +185,31 @@ import Testing
 @Test func aFastLoadNeverShowsTheSpinner() async {
   let clock = MockClock()
   let loader = IndefiniteLoader<String>(clock: clock)
+  let (released, release) = AsyncStream<Void>.makeStream()
   var states: [IndefiniteLoadState<String>] = []
 
-  await loader.load {
-    "fresh"
-  } loadState: { states.append($0) }
+  let load = Task {
+    await loader.load {
+      for await _ in released {}
+      return "fresh"
+    } loadState: { states.append($0) }
+  }
+
+  await clock.waitForPendingSleep()
+  release.finish()
+  await load.value
 
   #expect(states == [
     .loading(phase: .delayed),
     .loaded(data: "fresh", updatingPhase: nil, error: nil),
   ])
+  #expect(clock.pendingSleepCount == 0)
 }
 ```
 
-The delay timer parked on the clock and was cancelled when the operation won; nothing ever emitted
-`.active`. The [Testing](https://kalebcooper.github.io/swift-indefinite-loader/documentation/indefiniteloading/testing/)
+The operation waits on a stream until the delay timer is parked on the clock, then finishes inside
+the delay. The loader cancels the timer on its way out, so its sleep is gone rather than merely
+unfired, and nothing emits `.active`. The [Testing](https://kalebcooper.github.io/swift-indefinite-loader/documentation/indefiniteloading/testing/)
 article covers holding an operation mid-flight and advancing `MockClock` to each deadline a timing
 test depends on.
 
