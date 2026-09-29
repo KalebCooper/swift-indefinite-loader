@@ -82,7 +82,7 @@ builder.
 ## Installation
 
 ```swift
-.package(url: "https://github.com/KalebCooper/swift-indefinite-loader.git", from: "1.0.0")
+.package(url: "https://github.com/KalebCooper/swift-indefinite-loader.git", from: "2.0.0")
 ```
 
 | Product | Add it to |

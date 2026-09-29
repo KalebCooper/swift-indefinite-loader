@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+## [2.0.0] - 2026-09-28
+
 ### Changed
 
 - **Breaking:** `IndefiniteLoader.init(clock:delay:minimumDuration:timeout:)` takes
