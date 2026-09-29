@@ -151,8 +151,10 @@ struct IndefiniteLoaderTests {
     // Advancing past the delay deadline must still produce no `.active`. This does NOT catch a
     // missing `delayTimerTask?.cancel()` (`finalize()` clears `activeLoadID`, and
     // `handleDelayExpired` guards on it, so a late timer is suppressed anyway). It proves that
-    // second, independent guard holds: defence in depth.
+    // second, independent guard holds: defence in depth. With no sleeper left, the advance
+    // releases nothing; the drain gives work scheduled by the cancellation room to run.
     clock.advance(by: .milliseconds(800))
+    #expect(clock.pendingSleepCount == 0)
     await drainReleasedWork()
     #expect(recorder.activeCount == 0)
   }
@@ -311,6 +313,7 @@ struct IndefiniteLoaderTests {
     #expect(clock.pendingSleepCount == 0)
 
     clock.advance(by: .milliseconds(800))
+    #expect(clock.pendingSleepCount == 0)
     await drainReleasedWork()
     #expect(recorder.activeCount == 0)
   }
@@ -644,12 +647,20 @@ struct IndefiniteLoaderTests {
     case boom
   }
 
-  /// Yields a bounded number of times to give whatever `advance(by:)` released room to run.
+  /// Yields a small, fixed number of times to give work that is already scheduled room to run.
   ///
   /// The negative cases assert the *absence* of an `.active` state, so there is no count to poll
-  /// for; only a drain can distinguish "never emitted" from "not scheduled yet".
+  /// for; only a drain can distinguish "never emitted" from "not scheduled yet". They drain after
+  /// `pendingSleepCount` has shown no sleeper is left, so the advance released nothing and the
+  /// drain only covers work the delay timer's cancellation scheduled.
+  ///
+  /// The bound is sized against the positive cases: their longest hand-off, from opening the gate
+  /// through the operation finishing off the main actor to the terminal emit, took at most five
+  /// yields in repeated macOS and Linux runs, and an advance reached its `.active` emit within
+  /// three. A hundred is twenty times the longest and costs a few milliseconds. Too short a drain
+  /// cannot fail a correct loader; it can only miss a regression.
   private func drainReleasedWork() async {
-    for _ in 0..<maximumYieldIterations {
+    for _ in 0..<100 {
       await Task.yield()
     }
   }
