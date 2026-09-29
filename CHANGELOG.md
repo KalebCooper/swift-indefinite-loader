@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** `IndefiniteLoader.init(clock:delay:minimumDuration:timeout:)` takes
+  `any Clock<Duration>`, defaulting to `ContinuousClock()`. The loader measures how long its
+  indicator has been visible in the clock's own instants.
+- **Breaking:** `MockClock` is a standard library `Clock` with its own `MockClock.Instant`. A sleep
+  parks until `advance(by:)` moves the reading to its deadline and returns at once when the
+  deadline has already been reached, so a `delay: .zero` loader shows its indicator without the
+  test advancing anything. `now` is a property, and `init()` replaces `init(now:)`.
+
+### Removed
+
+- **Breaking:** `ClockProtocol` and `SystemClock`. Pass any `Clock` measured in `Duration`;
+  `ContinuousClock` is the default.
+- **Breaking:** `MockClock.advanceAllSleeps()`. Advance the reading to a sleep's deadline instead;
+  releasing a sleeper before its deadline would contradict the clock's reading.
+
 ## [1.0.0] - 2026-09-02
 
 ### Added

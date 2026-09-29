@@ -103,11 +103,11 @@ extension IndefiniteLoaderProtocol {
 /// The production ``IndefiniteLoaderProtocol``: one instance per load surface, held by whichever
 /// object renders the load state.
 ///
-/// Every sleep and every reading of "now" goes through the injected ``ClockProtocol``, so the
-/// timing rules are driven by a ``MockClock`` in tests and by ``SystemClock`` in production.
+/// Every sleep and every elapsed-time measurement goes through the injected `Clock`, so the timing
+/// rules are driven by a ``MockClock`` in tests and by `ContinuousClock` in production.
 @MainActor
 public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
-  private let clock: any ClockProtocol
+  private let clock: any Clock<Duration>
   private let delay: Duration
   private let minimumDuration: Duration
   private let timeout: Duration?
@@ -118,16 +118,17 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
   /// failure and (b) rewind the consumer to a stable `.loaded(...)` state on cancellation.
   private var existingData: T?
   /// Non-nil exactly when the loading indicator is currently shown to the consumer.
-  /// Stores the moment the indicator was first emitted so `enforceMinimumDuration` can compute
-  /// how much longer to keep it visible.
-  private var loadingShownAt: Date?
+  /// Started when the indicator was first emitted so `enforceMinimumDuration` can compute how much
+  /// longer to keep it visible.
+  private var indicatorStopwatch: Stopwatch?
   private var loadStateCallback: (@MainActor (IndefiniteLoadState<T>) -> Void)?
   private var operationTask: Task<T, any Error>?
 
   /// Creates a loader.
   ///
   /// - Parameters:
-  ///   - clock: The clock the loader sleeps on and reads. Defaults to ``SystemClock``.
+  ///   - clock: The clock the loader sleeps on and measures elapsed time with. Defaults to
+  ///     `ContinuousClock`.
   ///   - delay: How long the operation may run before the loading indicator becomes visible.
   ///     The default of 0.8 s is calibrated to the human perception threshold for waiting UI.
   ///   - minimumDuration: How long the loading indicator stays visible *once shown*. Prevents
@@ -136,9 +137,9 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
   ///     duration the loader emits `.failed(IndefiniteLoaderError.timedOut)` (or `.loaded`
   ///     with the timeout error if `existingData` was supplied). `nil` disables the timeout.
   public init(
-    clock: any ClockProtocol = SystemClock(),
-    delay: Duration = .seconds(0.8),
-    minimumDuration: Duration = .seconds(1.2),
+    clock: any Clock<Duration> = ContinuousClock(),
+    delay: Duration = .milliseconds(800),
+    minimumDuration: Duration = .milliseconds(1200),
     timeout: Duration? = nil
   ) {
     self.clock = clock
@@ -169,7 +170,7 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
     operationTask?.cancel()
     delayTimerTask = nil
     existingData = nil
-    loadingShownAt = nil
+    indicatorStopwatch = nil
     loadStateCallback = nil
     operationTask = nil
   }
@@ -214,7 +215,7 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
     // Bail if the consumer cancelled (or restarted) the loader from inside the initial emit.
     guard activeLoadID == loadID else { return }
 
-    let clock: any ClockProtocol = self.clock
+    let clock: any Clock<Duration> = self.clock
     let timeout: Duration? = self.timeout
     let operationTask: Task<T, any Error> = Task {
       try await Self.runOperation(operation, timeout: timeout, clock: clock)
@@ -255,9 +256,8 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
   }
 
   private func enforceMinimumDuration(loadID: UUID) async -> Bool {
-    if let loadingShownAt {
-      let elapsed: Duration = .seconds(clock.now().timeIntervalSince(loadingShownAt))
-      let remaining: Duration = minimumDuration - elapsed
+    if let indicatorStopwatch {
+      let remaining: Duration = minimumDuration - indicatorStopwatch.elapsed()
       if remaining > .zero {
         do { try await clock.sleep(for: remaining) } catch { return false }
         guard activeLoadID == loadID else { return false }
@@ -269,7 +269,8 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
   private func handleDelayExpired(loadID: UUID, existingData: T?) {
     guard activeLoadID == loadID else { return }
 
-    loadingShownAt = clock.now()
+    let clock: any Clock<Duration> = self.clock
+    indicatorStopwatch = Stopwatch.start(on: clock)
 
     if let existingData {
       loadStateCallback?(.loaded(data: existingData, updatingPhase: .active, error: nil))
@@ -286,7 +287,7 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
   private static func runOperation(
     _ operation: @Sendable @escaping () async throws -> T,
     timeout: Duration?,
-    clock: any ClockProtocol
+    clock: any Clock<Duration>
   ) async throws -> T {
     guard let timeout else {
       return try await operation()
@@ -310,8 +311,26 @@ public final class IndefiniteLoader<T: Sendable>: IndefiniteLoaderProtocol {
     activeLoadID = nil
     delayTimerTask = nil
     existingData = nil
-    loadingShownAt = nil
+    indicatorStopwatch = nil
     loadStateCallback = nil
     operationTask = nil
+  }
+}
+
+// MARK: - Stopwatch
+
+/// Measures the time elapsed since it was started, on a clock whose instant type is erased.
+///
+/// The loader holds its clock as `any Clock<Duration>`, whose `Instant` cannot be stored and later
+/// subtracted without knowing the concrete clock. Starting the stopwatch opens the existential
+/// once and keeps the start instant next to the clock it came from.
+private struct Stopwatch {
+  let elapsed: () -> Duration
+
+  /// Starts a stopwatch at `clock`'s current reading. Passing an `any Clock<Duration>` opens it,
+  /// so the start instant keeps its concrete type.
+  static func start<C: Clock<Duration>>(on clock: C) -> Stopwatch {
+    let start: C.Instant = clock.now
+    return Stopwatch { start.duration(to: clock.now) }
   }
 }

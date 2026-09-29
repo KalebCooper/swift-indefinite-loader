@@ -21,9 +21,9 @@ a major release, never a minor one.
   nothing Darwin-specific from either. Anything that needs SwiftUI belongs in
   `Sources/IndefiniteLoadingUI/`, inside `#if canImport(SwiftUI)`, so the module compiles to nothing
   where SwiftUI is absent.
-- **Tests:** Swift Testing only. Deterministic: every sleep and every reading of "now" goes through
-  the injected `MockClock`; never sleep or read the wall clock. The emitted state *sequence* is the
-  contract, so assert the whole sequence, not the final state.
+- **Tests:** Swift Testing only. Deterministic: every sleep and every elapsed-time measurement goes
+  through the injected `MockClock`, advanced to each deadline; never sleep or read the wall clock.
+  The emitted state *sequence* is the contract, so assert the whole sequence, not the final state.
 - **Style:** `swift format lint --strict --recursive Sources Tests` must report zero findings.
   Parameters, stored properties, and enum cases are alphabetical within their grouping unless
   initialization order or a logical dependency dictates otherwise.

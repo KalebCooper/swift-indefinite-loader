@@ -75,7 +75,8 @@ builder.
   do not show it yet" is a state a view can render, not a flag it has to remember.
 - Two SwiftUI renderers, in their own product, that encode the grace period structurally, so a
   view cannot defeat it by accident.
-- A clock seam: `MockClock` moves only when a test moves it, so every timing rule is asserted as a
+- A clock seam: the loader sleeps on any `Clock` measured in `Duration`, `ContinuousClock` by
+  default. `MockClock` moves only when a test moves it, so every timing rule is asserted as a
   sequence of states rather than measured against wall time.
 
 ## Installation
@@ -172,8 +173,9 @@ minimum-duration hold as any other failure.
 
 ### Testing
 
-`MockClock` parks every sleep until the test releases it and moves its reading only when told, so a
-test drives the loader through each transition and asserts the sequence it emitted:
+`MockClock` moves its reading only when told and ends each sleep when the reading reaches the
+sleep's deadline, so a test drives the loader through each transition and asserts the sequence it
+emitted:
 
 ```swift
 import IndefiniteLoading
@@ -198,8 +200,8 @@ import Testing
 
 The delay timer parked on the clock and was cancelled when the operation won; nothing ever emitted
 `.active`. The [Testing](https://kalebcooper.github.io/swift-indefinite-loader/documentation/indefiniteloading/testing/)
-article covers holding an operation mid-flight and the two `MockClock` rules every timing test
-depends on.
+article covers holding an operation mid-flight and advancing `MockClock` to each deadline a timing
+test depends on.
 
 ## Requirements
 

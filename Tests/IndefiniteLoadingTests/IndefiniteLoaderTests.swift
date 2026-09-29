@@ -45,8 +45,8 @@ private final class StateRecorder<Payload: Sendable> {
 /// A one-shot, cancellation-aware gate used to hold an operation mid-flight and release it on cue.
 ///
 /// Deliberately NOT clock-based: the loader's delay and minimum-duration sleeps live on `MockClock`,
-/// so gating the operation there would make `advanceAllSleeps()` release the operation too; the
-/// test could no longer control which side of the race wins, which is the only thing these tests
+/// so gating the operation there would make `advance(by:)` release the operation too; the test
+/// could no longer control which side of the race wins, which is the only thing these tests
 /// are here to measure. It must be cancellation-aware or the cancellation tests deadlock: `load`
 /// awaits the operation task's value, so an operation that ignores cancellation never returns.
 private struct OperationGate: Sendable {
@@ -70,16 +70,16 @@ private struct OperationGate: Sendable {
 }
 
 /// `IndefiniteLoader` proofs against `MockClock`. All time is driven through the clock
-/// (`waitForPendingSleep()` awaits the loader parking in a sleep; `advance(by:)` moves `now()`;
-/// `advanceAllSleeps()` releases parked sleeps). No wall-clock sleeps anywhere.
+/// (`waitForPendingSleep()` awaits the loader parking in a sleep; `advance(by:)` moves the reading
+/// and releases every sleep whose deadline it reaches). No wall-clock sleeps anywhere.
 ///
-/// Two `MockClock` properties shape every test here and are easy to get wrong:
-/// 1. `sleep(for:)` **ignores the duration** and parks until `advanceAllSleeps()`, including
-///    `sleep(for: .zero)`. A `delay: .zero` loader therefore never fires its delay timer unless
-///    the test releases it explicitly.
-/// 2. `now()` does **not** auto-advance when sleeps are released. `enforceMinimumDuration` reads
-///    `clock.now()`, so a minimum-duration test must `advance(by:)` *and* `advanceAllSleeps()`, or
-///    `elapsed` computes as 0.
+/// Two `MockClock` properties shape every test here:
+/// 1. A sleep ends when the reading reaches its deadline, not a moment before, and a sleep whose
+///    deadline has already been reached returns at once. A `delay: .zero` loader therefore shows
+///    its indicator without the test advancing anything.
+/// 2. The reading never moves on its own. A sleeper computes its deadline from the reading when
+///    it registers, so a test awaits the sleeper before advancing, or the deadline lands later
+///    than the test assumes.
 @MainActor
 @Suite("IndefiniteLoader", .serialized)
 struct IndefiniteLoaderTests {
@@ -125,11 +125,11 @@ struct IndefiniteLoaderTests {
     // assertion that actually detects a missing `delayTimerTask?.cancel()`.
     #expect(clock.pendingSleepCount == 0)
 
-    // Releasing every sleep must still produce no `.active`. This does NOT catch a missing
-    // `delayTimerTask?.cancel()` (`finalize()` clears `activeLoadID`, and `handleDelayExpired`
-    // guards on it, so a late timer is suppressed anyway). It proves that second, independent
-    // guard holds: defence in depth.
-    clock.advanceAllSleeps()
+    // Advancing past the delay deadline must still produce no `.active`. This does NOT catch a
+    // missing `delayTimerTask?.cancel()` (`finalize()` clears `activeLoadID`, and
+    // `handleDelayExpired` guards on it, so a late timer is suppressed anyway). It proves that
+    // second, independent guard holds: defence in depth.
+    clock.advance(by: .milliseconds(800))
     await drainReleasedWork()
     #expect(recorder.activeCount == 0)
   }
@@ -152,16 +152,15 @@ struct IndefiniteLoaderTests {
 
     await clock.waitForPendingSleep()
 
-    // `now()` must advance too: `handleDelayExpired` stamps `loadingShownAt = clock.now()`, and
-    // the minimum-duration arithmetic below is computed from it.
-    clock.advance(by: .seconds(0.8))
-    clock.advanceAllSleeps()
+    // Reaching the delay deadline releases the timer; the indicator is shown at this reading, and
+    // the minimum-duration arithmetic below is measured from it.
+    clock.advance(by: .milliseconds(800))
     await waitForStates(2, on: recorder)
 
     #expect(recorder.states == [.loading(phase: .delayed), .loading(phase: .active)])
 
     // The spinner has been up 0.5 s of its 1.2 s minimum when the operation resolves.
-    clock.advance(by: .seconds(0.5))
+    clock.advance(by: .milliseconds(500))
     gate.open()
 
     // The loader parks in `enforceMinimumDuration`'s sleep instead of emitting the terminal
@@ -169,11 +168,83 @@ struct IndefiniteLoaderTests {
     await clock.waitForPendingSleep()
     #expect(recorder.states.count == 2)
 
-    // Release the remaining 0.7 s.
-    clock.advance(by: .seconds(0.7))
-    clock.advanceAllSleeps()
-    await loadTask.value
+    // Reaching the remaining 0.7 s releases the hold.
+    clock.advance(by: .milliseconds(700))
+    await finish(loadTask) { recorder.states.count == 3 }
 
+    #expect(
+      recorder.states == [
+        .loading(phase: .delayed),
+        .loading(phase: .active),
+        .loaded(data: "fresh", updatingPhase: nil, error: nil),
+      ])
+  }
+
+  @Test("The indicator stays hidden one nanosecond short of the delay and shows at the delay")
+  func indicatorShowsExactlyAtDelayDeadline() async {
+    let clock = MockClock()
+    let gate = OperationGate()
+    let recorder = StateRecorder<String>()
+    let sut = makeLoader(clock: clock, payload: String.self)
+
+    let loadTask = Task {
+      await sut.load {
+        try await gate.wait()
+        return "fresh"
+      } loadState: {
+        recorder.record($0)
+      }
+    }
+
+    await clock.waitForPendingSleep()
+
+    // The timer is still registered, not merely unscheduled: the reading has not reached its
+    // deadline, so nothing was released.
+    clock.advance(by: .milliseconds(800) - .nanoseconds(1))
+    #expect(clock.pendingSleepCount == 1)
+    #expect(recorder.states == [.loading(phase: .delayed)])
+
+    clock.advance(by: .nanoseconds(1))
+    await waitForStates(2, on: recorder)
+    #expect(recorder.states == [.loading(phase: .delayed), .loading(phase: .active)])
+
+    loadTask.cancel()
+    await loadTask.value
+  }
+
+  /// The indicator is shown 200 ms after the delay deadline, so a hold measured from the deadline
+  /// ends 200 ms early and a hold that restarts the full minimum when the operation resolves ends
+  /// 500 ms late. Only a hold measured from the instant the indicator appeared ends exactly here.
+  @Test("The hold ends minimumDuration after the instant the indicator was shown")
+  func holdEndsMinimumDurationAfterIndicatorShown() async {
+    let clock = MockClock()
+    let gate = OperationGate()
+    let recorder = StateRecorder<String>()
+    let sut = makeLoader(clock: clock, payload: String.self)
+
+    let loadTask = Task {
+      await sut.load {
+        try await gate.wait()
+        return "fresh"
+      } loadState: {
+        recorder.record($0)
+      }
+    }
+
+    await clock.waitForPendingSleep()
+    clock.advance(by: .milliseconds(1000))
+    await waitForStates(2, on: recorder)
+
+    clock.advance(by: .milliseconds(500))
+    gate.open()
+    await clock.waitForPendingSleep()
+
+    clock.advance(by: .milliseconds(700) - .nanoseconds(1))
+    #expect(clock.pendingSleepCount == 1)
+    #expect(recorder.states.count == 2)
+
+    clock.advance(by: .nanoseconds(1))
+    await finish(loadTask) { recorder.states.count == 3 }
     #expect(
       recorder.states == [
         .loading(phase: .delayed),
@@ -216,7 +287,7 @@ struct IndefiniteLoaderTests {
     // As in the cold case, the timer is cancelled rather than merely unfired.
     #expect(clock.pendingSleepCount == 0)
 
-    clock.advanceAllSleeps()
+    clock.advance(by: .milliseconds(800))
     await drainReleasedWork()
     #expect(recorder.activeCount == 0)
   }
@@ -240,8 +311,7 @@ struct IndefiniteLoaderTests {
     }
 
     await clock.waitForPendingSleep()
-    clock.advance(by: .seconds(0.8))
-    clock.advanceAllSleeps()
+    clock.advance(by: .milliseconds(800))
     await waitForStates(2, on: recorder)
 
     #expect(
@@ -252,9 +322,9 @@ struct IndefiniteLoaderTests {
 
     // Advancing past the full minimum BEFORE the operation resolves means `remaining <= .zero`,
     // so the terminal state emits without parking a second sleep.
-    clock.advance(by: .seconds(1.2))
+    clock.advance(by: .milliseconds(1200))
     gate.open()
-    await loadTask.value
+    await finish(loadTask) { recorder.states.count == 3 }
 
     #expect(
       recorder.states == [
@@ -424,7 +494,7 @@ struct IndefiniteLoaderTests {
   // MARK: - Submission configuration
 
   @Test(
-    "The submission configuration (delay: .zero) emits .active once released, then holds minimumDuration"
+    "The submission configuration (delay: .zero) emits .active at once, then holds minimumDuration"
   )
   func submissionConfigShowsSpinnerThenHoldsMinimumDuration() async {
     let clock = MockClock()
@@ -433,7 +503,7 @@ struct IndefiniteLoaderTests {
     let sut = makeLoader(
       clock: clock,
       delay: .zero,
-      minimumDuration: .seconds(0.4),
+      minimumDuration: .milliseconds(400),
       payload: Void.self
     )
 
@@ -445,13 +515,8 @@ struct IndefiniteLoaderTests {
       }
     }
 
-    // `MockClock.sleep(for:)` ignores the duration, so `.zero` parks exactly like `.seconds(0.8)`
-    // and `.active` cannot fire until the test releases it. Asserting `.delayed` alone here is
-    // the empirical proof of that trap, rather than a claim about it.
-    await clock.waitForPendingSleep()
-    #expect(recorder.shapes == [.loading(phase: .delayed)])
-
-    clock.advanceAllSleeps()
+    // A zero delay's deadline is the reading it was armed at, so the timer returns at once and
+    // `.active` follows `.delayed` without the test advancing anything.
     await waitForStates(2, on: recorder)
     #expect(recorder.shapes == [.loading(phase: .delayed), .loading(phase: .active)])
 
@@ -462,9 +527,8 @@ struct IndefiniteLoaderTests {
     await clock.waitForPendingSleep()
     #expect(recorder.shapes.count == 2)
 
-    clock.advance(by: .seconds(0.4))
-    clock.advanceAllSleeps()
-    await loadTask.value
+    clock.advance(by: .milliseconds(400))
+    await finish(loadTask) { recorder.shapes.count == 3 }
 
     #expect(
       recorder.shapes == [
@@ -504,9 +568,46 @@ struct IndefiniteLoaderTests {
     // TWO sleeps are armed here: the delay timer, and the timeout race inside the operation.
     await waitForPendingSleeps(2, on: clock)
     clock.advance(by: .seconds(5))
-    clock.advanceAllSleeps()
-    await loadTask.value
+    await finish(loadTask) { recorder.shapes.last == .failed }
 
+    guard case .failed(let error) = recorder.states.last else {
+      Issue.record("Expected `.failed`, got \(String(describing: recorder.states.last))")
+      return
+    }
+    #expect(error as? IndefiniteLoaderError == .timedOut)
+  }
+
+  @Test("The timeout fires when the reading reaches it, not one nanosecond before")
+  func timeoutFiresExactlyAtDeadline() async {
+    let clock = MockClock()
+    let gate = OperationGate()
+    let recorder = StateRecorder<String>()
+    let sut = makeLoader(
+      clock: clock,
+      minimumDuration: .zero,
+      payload: String.self,
+      timeout: .seconds(5)
+    )
+
+    let loadTask = Task {
+      await sut.load {
+        try await gate.wait()
+        return "fresh"
+      } loadState: {
+        recorder.record($0)
+      }
+    }
+
+    await waitForPendingSleeps(2, on: clock)
+
+    // The delay timer's deadline is passed, the timeout's is not: only the timeout stays parked.
+    clock.advance(by: .seconds(5) - .nanoseconds(1))
+    await waitForStates(2, on: recorder)
+    #expect(clock.pendingSleepCount == 1)
+    #expect(recorder.shapes == [.loading(phase: .delayed), .loading(phase: .active)])
+
+    clock.advance(by: .nanoseconds(1))
+    await finish(loadTask) { recorder.shapes.count == 3 }
     guard case .failed(let error) = recorder.states.last else {
       Issue.record("Expected `.failed`, got \(String(describing: recorder.states.last))")
       return
@@ -524,7 +625,7 @@ struct IndefiniteLoaderTests {
     case boom
   }
 
-  /// Yields a bounded number of times to give whatever `advanceAllSleeps()` released room to run.
+  /// Yields a bounded number of times to give whatever `advance(by:)` released room to run.
   ///
   /// The negative cases assert the *absence* of an `.active` state, so there is no count to poll
   /// for; only a drain can distinguish "never emitted" from "not scheduled yet".
@@ -534,10 +635,29 @@ struct IndefiniteLoaderTests {
     }
   }
 
+  /// Awaits `loadTask` once `condition` holds, bounded like every other wait here.
+  ///
+  /// A load parked on a deadline the test never reaches would hang a bare `await loadTask.value`.
+  /// Cancelling first turns that regression into a failed wait and a returned task; once the load
+  /// has already finished, the cancel is a no-op.
+  private func finish(_ loadTask: Task<Void, Never>, once condition: () -> Bool) async {
+    var iterations = 0
+    while !condition() {
+      guard iterations < Self.maximumYieldIterations else {
+        Issue.record("Timed out waiting for the load to finish.")
+        break
+      }
+      iterations += 1
+      await Task.yield()
+    }
+    loadTask.cancel()
+    await loadTask.value
+  }
+
   private func makeLoader<Payload: Sendable>(
-    clock: any ClockProtocol,
-    delay: Duration = .seconds(0.8),
-    minimumDuration: Duration = .seconds(1.2),
+    clock: any Clock<Duration>,
+    delay: Duration = .milliseconds(800),
+    minimumDuration: Duration = .milliseconds(1200),
     payload: Payload.Type,
     timeout: Duration? = nil
   ) -> IndefiniteLoader<Payload> {
@@ -545,9 +665,9 @@ struct IndefiniteLoaderTests {
       clock: clock, delay: delay, minimumDuration: minimumDuration, timeout: timeout)
   }
 
-  /// Yields until `count` tasks are parked in `MockClock.sleep(for:)`. `waitForPendingSleep()` only
-  /// guarantees at least one; the `timeout:` configuration arms two, and releasing them before both
-  /// are parked would strand one and hang the test.
+  /// Yields until `count` tasks are parked on `MockClock`. `waitForPendingSleep()` only guarantees
+  /// at least one; the `timeout:` configuration arms two, and advancing before both are parked
+  /// would move the reading under the late one and push its deadline past the test's advance.
   private func waitForPendingSleeps(_ count: Int, on clock: MockClock) async {
     await clock.waitForPendingSleep()
     while clock.pendingSleepCount < count {
@@ -557,8 +677,8 @@ struct IndefiniteLoaderTests {
 
   /// Yields until `recorder` has captured `count` states.
   ///
-  /// `advanceAllSleeps()` only resumes the delay timer's continuation; the emit happens later, in
-  /// that task. A bare `Task.yield()` buys exactly one executor hop, which does not guarantee the
+  /// `advance(by:)` only resumes the delay timer's continuation; the emit happens later, in that
+  /// task. A bare `Task.yield()` buys exactly one executor hop, which does not guarantee the
   /// resumed task ran. Waiting on the postcondition itself removes the scheduling assumption.
   private func waitForStates<Payload: Sendable>(
     _ count: Int,
@@ -573,5 +693,30 @@ struct IndefiniteLoaderTests {
       iterations += 1
       await Task.yield()
     }
+  }
+}
+
+/// `MockClock` proofs for the guarantees the loader suite relies on but cannot observe directly.
+@Suite("MockClock")
+struct MockClockTests {
+  @Test("Cancelling a parked sleeper throws CancellationError and unregisters it")
+  func cancellingParkedSleeperThrowsAndUnregisters() async {
+    let clock = MockClock()
+    let deadline = clock.now.advanced(by: .seconds(1))
+    let sleeper = Task {
+      try await clock.sleep(until: deadline)
+    }
+
+    await clock.waitForPendingSleep()
+    sleeper.cancel()
+    await #expect(throws: CancellationError.self) {
+      try await sleeper.value
+    }
+    #expect(clock.pendingSleepCount == 0)
+
+    // Reaching the cancelled deadline resumes nothing: a second resume of the same continuation
+    // would trap.
+    clock.advance(by: .seconds(2))
+    #expect(clock.now == deadline.advanced(by: .seconds(1)))
   }
 }
